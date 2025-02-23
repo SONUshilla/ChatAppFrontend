@@ -6,7 +6,7 @@ import VideoChat from './videochat';
 function App() {
   return (
     <div className="App">
-      <VideoChat/>
+      <Chat/>
     </div>
   );
 }

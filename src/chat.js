@@ -40,7 +40,7 @@ const Chat = () => {
   const startChat = () => {
     initializeMedia();
     setStatus("waiting");
-    socketRef.current = io("http://localhost:5000");
+    socketRef.current = io("https://chatappbackend-yhpt.onrender.com");
 
     socketRef.current.on("connect", () => {});
     
@@ -61,7 +61,11 @@ const Chat = () => {
         }
       });
 
+
+
+
       peer.on("signal", (signal) => {
+        alert("sending signal")
         socketRef.current.emit("webrtc-signal", {
           room: data.room,
           signal
@@ -83,6 +87,7 @@ const Chat = () => {
     });
 
     socketRef.current.on("webrtc-signal", (signal) => {
+      console.log(signal)
       if (peerRef.current) {
         peerRef.current.signal(signal);
       }
