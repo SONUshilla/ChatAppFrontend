@@ -33,7 +33,7 @@ const VideoChat = () => {
   // Start the call: Connect to the signaling server and set up event listeners.
   const startCall = () => {
     // Connect to the Socket.io signaling server.
-    socketRef.current = io("http://localhost:5000");
+    socketRef.current = io("https://chatappbackend-yhpt.onrender.com");
 
     socketRef.current.on("connect", () => {
       console.log("Connected to signaling server");
