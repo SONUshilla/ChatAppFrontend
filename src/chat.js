@@ -1,7 +1,9 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { io } from "socket.io-client";
 import Peer from "simple-peer";
 import "./chat.css";
+import process from "process";
+window.process = process;
 
 const Chat = () => {
   const [status, setStatus] = useState("disconnected");
@@ -11,7 +13,8 @@ const Chat = () => {
   const [showConfirmPopup, setShowConfirmPopup] = useState(false);
   const [localStream, setLocalStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
-  
+  const [file, setFile] = useState(null); // file is null by default
+
   const socketRef = useRef(null);
   const peerRef = useRef(null);
   const localVideoRef = useRef(null);
@@ -22,99 +25,155 @@ const Chat = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chat]);
 
-  const initializeMedia = async () => {
+  // initializeMedia: Try to use device camera & mic; if unavailable and a file is provided, use it.
+  const initializeMedia = useCallback(async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: true, 
-        audio: true 
-      });
+      let stream;
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        try {
+          // Attempt to get media from the device's camera and microphone.
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true,
+          });
+          console.log("Using device camera and microphone");
+        } catch (err) {
+          console.warn("getUserMedia failed. Falling back to file stream if available.", err);
+          // Fallback: If a file is provided, use it.
+          if (file) {
+            stream = await getStreamFromFile(file);
+          } else {
+            throw new Error("No camera/microphone available and no file provided");
+          }
+        }
+      } else {
+        // Fallback if getUserMedia is not supported.
+        if (file) {
+          stream = await getStreamFromFile(file);
+        } else {
+          throw new Error("No media available on this device");
+        }
+      }
       setLocalStream(stream);
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
       }
+      return stream;
     } catch (error) {
-      console.error("Error accessing media devices:", error);
+      console.error("Error initializing media:", error);
+      throw error;
     }
+  }, [file]);
+
+  // Helper function: Get a stream from a selected video file.
+  const getStreamFromFile = async (file) => {
+    return new Promise((resolve, reject) => {
+      const videoURL = URL.createObjectURL(file);
+      const videoElement = document.createElement("video");
+      videoElement.src = videoURL;
+      videoElement.muted = true; // required for autoplay
+      videoElement.onloadedmetadata = async () => {
+        try {
+          await videoElement.play();
+          const stream = videoElement.captureStream();
+          resolve(stream);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      videoElement.onerror = (err) => reject(err);
+      videoElement.load();
+    });
   };
 
-  const startChat = () => {
-    initializeMedia();
-    setStatus("waiting");
-    socketRef.current = io("https://chatappbackend-yhpt.onrender.com");
+  // If a file is selected, we attempt to initialize media from it (if device media wasn’t already used).
+  useEffect(() => {
+    if (file) {
+      initializeMedia().catch((err) =>
+        console.error("Error initializing media with file fallback:", err)
+      );
+    }
+  }, [file, initializeMedia]);
 
-    socketRef.current.on("connect", () => {});
-    
-    socketRef.current.on("waiting", () => setStatus("waiting"));
-    
-    socketRef.current.on("paired", (data) => {
-      setRoom(data.room);
-      setStatus("paired");
+  const startChat = async () => {
+    try {
+      const stream = await initializeMedia();
+      setStatus("waiting");
+      socketRef.current = io("https://chatappbackend-yhpt.onrender.com");
 
-      const peer = new Peer({
-        initiator: data.isInitiator,
-        stream: localStream,
-        config: {
-          iceServers: [
-            { urls: "stun:stun.l.google.com:19302" },
-            { urls: "stun:global.stun.twilio.com:3478?transport=udp" }
-          ]
-        }
+      socketRef.current.on("connect", () => {
+        console.log("Socket connected");
       });
 
+      socketRef.current.on("waiting", () => setStatus("waiting"));
 
+      socketRef.current.on("paired", (data) => {
+        setRoom(data.room);
+        setStatus("paired");
 
-
-      peer.on("signal", (signal) => {
-        alert("sending signal")
-        socketRef.current.emit("webrtc-signal", {
-          room: data.room,
-          signal
+        const peer = new Peer({
+          initiator: data.isInitiator,
+          stream: stream, // use the stream from initializeMedia
+          config: {
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+          },
         });
+
+        peer.on("signal", (signal) => {
+          console.log("Sending signal:", signal);
+          socketRef.current.emit("webrtc-signal", {
+            room: data.room,
+            signal,
+          });
+        });
+
+        peer.on("stream", (remoteStreamReceived) => {
+          setRemoteStream(remoteStreamReceived);
+          console.log("Remote stream received:", remoteStreamReceived);
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = remoteStreamReceived;
+          }
+        });
+
+        peer.on("error", (error) => {
+          console.error("WebRTC error:", error);
+        });
+
+        peerRef.current = peer;
       });
 
-      peer.on("stream", (stream) => {
-        setRemoteStream(stream);
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = stream;
+      socketRef.current.on("webrtc-signal", (signal) => {
+        console.log("Received signal:", signal);
+        if (peerRef.current) {
+          peerRef.current.signal(signal);
         }
       });
 
-      peer.on("error", (error) => {
-        console.error("WebRTC error:", error);
+      socketRef.current.on("message", (msg) =>
+        setChat((prev) => [...prev, { text: msg, isMe: false }])
+      );
+
+      socketRef.current.on("partner-disconnected", () => {
+        setChat((prev) => [
+          ...prev,
+          {
+            text: "Partner has disconnected. Searching for new partner...",
+            isSystem: true,
+            animate: true,
+          },
+        ]);
+        handleDisconnect();
       });
 
-      peerRef.current = peer;
-    });
-
-    socketRef.current.on("webrtc-signal", (signal) => {
-      console.log(signal)
-      if (peerRef.current) {
-        peerRef.current.signal(signal);
-      }
-    });
-
-    socketRef.current.on("message", (msg) =>
-      setChat((prev) => [...prev, { text: msg, isMe: false }])
-    );
-
-    socketRef.current.on("partner-disconnected", () => {
-      setChat((prev) => [
-        ...prev,
-        {
-          text: "Partner has disconnected. Searching for new partner...",
-          isSystem: true,
-          animate: true
-        }
-      ]);
-      handleDisconnect();
-    });
-
-    socketRef.current.on("notification", (data) => {
-      setChat((prevChat) => [
-        ...prevChat,
-        { text: data.message, isSystem: true },
-      ]);
-    });
+      socketRef.current.on("notification", (data) => {
+        setChat((prevChat) => [
+          ...prevChat,
+          { text: data.message, isSystem: true },
+        ]);
+      });
+    } catch (error) {
+      console.error("Error starting chat:", error);
+    }
   };
 
   const handleDisconnect = () => {
@@ -123,7 +182,7 @@ const Chat = () => {
       peerRef.current = null;
     }
     if (localStream) {
-      localStream.getTracks().forEach(track => track.stop());
+      localStream.getTracks().forEach((track) => track.stop());
     }
     setRemoteStream(null);
   };
@@ -185,14 +244,27 @@ const Chat = () => {
         </header>
 
         <div style={styles.videoContainer}>
-          {remoteStream && (
+          {remoteStream ? (
             <video
               ref={remoteVideoRef}
               autoPlay
               playsInline
               style={styles.remoteVideo}
             />
+          ) : (
+            <p>No remote stream</p>
           )}
+
+          <input
+            type="file"
+            accept="video/*"
+            onChange={(e) => {
+              const selectedFile = e.target.files[0];
+              console.log("File selected:", selectedFile);
+              setFile(selectedFile);
+            }}
+          />
+
           {localStream && (
             <video
               ref={localVideoRef}
@@ -249,10 +321,7 @@ const Chat = () => {
               <button style={styles.confirmButton} onClick={endChat}>
                 Yes
               </button>
-              <button
-                style={styles.cancelPopupButton}
-                onClick={closeConfirmPopup}
-              >
+              <button style={styles.cancelPopupButton} onClick={closeConfirmPopup}>
                 Cancel
               </button>
             </div>
@@ -263,32 +332,80 @@ const Chat = () => {
   );
 };
 
-// Keep your existing styles object and add these video styles:
 const styles = {
-  // ... (keep all your existing styles)
-  
+  fullContainer: {
+    // Your container styles
+  },
+  chatContainer: {
+    // Your chat container styles
+  },
+  chatHeader: {
+    // Your header styles
+  },
   videoContainer: {
-    position: 'relative',
-    width: '100%',
-    height: '300px',
-    backgroundColor: '#000',
-    borderBottom: '2px solid #ddd'
+    position: "relative",
+    width: "100%",
+    height: "300px",
+    backgroundColor: "#000",
+    borderBottom: "2px solid #ddd",
   },
   remoteVideo: {
-    width: '100%',
-    height: '100%',
-    objectFit: 'cover'
+    width: "100%",
+    height: "100%",
+    objectFit: "cover",
   },
   localVideo: {
-    position: 'absolute',
-    bottom: '20px',
-    right: '20px',
-    width: '120px',
-    height: '90px',
-    borderRadius: '8px',
-    border: '2px solid white',
-    objectFit: 'cover',
-    zIndex: 1
+    position: "absolute",
+    bottom: "20px",
+    right: "20px",
+    width: "120px",
+    height: "90px",
+    borderRadius: "8px",
+    border: "2px solid white",
+    objectFit: "cover",
+    zIndex: 1,
+  },
+  messagesContainer: {
+    // Your messages container styles
+  },
+  messageBubble: {
+    // Your message bubble styles
+  },
+  systemMessage: {
+    // Your system message styles
+  },
+  animatedSystemMessage: {
+    // Your animated system message styles
+  },
+  myMessage: {
+    // Your "my message" styles
+  },
+  partnerMessage: {
+    // Your partner message styles
+  },
+  inputContainer: {
+    // Your input container styles
+  },
+  inputField: {
+    // Your input field styles
+  },
+  sendButton: {
+    // Your send button styles
+  },
+  popupOverlay: {
+    // Your popup overlay styles
+  },
+  popupContainer: {
+    // Your popup container styles
+  },
+  popupButtons: {
+    // Your popup buttons styles
+  },
+  confirmButton: {
+    // Your confirm button styles
+  },
+  cancelPopupButton: {
+    // Your cancel popup button styles
   },
 };
 
